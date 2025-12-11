@@ -6,6 +6,7 @@ import {
   View,
   TouchableOpacity,
 } from "react-native";
+import Slider from "@react-native-community/slider";
 import {
   Camera,
   Moon,
@@ -31,10 +32,13 @@ export default function NightVisionCamera() {
   const [enhancementMode, setEnhancementMode] = useState<EnhancementMode>("full");
   const [motionDetection, setMotionDetection] = useState(true);
   const [motionDetected, setMotionDetected] = useState(false);
+  const [intensity, setIntensity] = useState(1.0);
 
   const cameraRef = useRef<CameraView>(null);
   const previousFrameRef = useRef<string | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
+  const motionHistoryRef = useRef<boolean[]>([]);
+  const consecutiveMotionRef = useRef<number>(0);
 
   useEffect(() => {
     // Load alert sound on mount
@@ -119,8 +123,25 @@ export default function NightVisionCamera() {
           });
 
           const result = await response.json();
-          if (result.motion) {
-            setMotionDetected(true);
+          
+          // Smart temporal filtering: require motion in 2 out of last 3 frames
+          motionHistoryRef.current.push(result.motion);
+          if (motionHistoryRef.current.length > 3) {
+            motionHistoryRef.current.shift();
+          }
+          
+          const motionCount = motionHistoryRef.current.filter(Boolean).length;
+          const smartMotionDetected = motionCount >= 2 && result.confidence > 0.3;
+          
+          if (smartMotionDetected) {
+            consecutiveMotionRef.current += 1;
+            // Trigger alert only after 2 consecutive positive detections
+            if (consecutiveMotionRef.current >= 2) {
+              setMotionDetected(true);
+              console.log(`Smart Motion: confidence=${result.confidence.toFixed(2)}, magnitude=${result.motion_magnitude.toFixed(1)}, center=${JSON.stringify(result.motion_center)}`);
+            }
+          } else {
+            consecutiveMotionRef.current = 0;
           }
         }
 
@@ -296,6 +317,20 @@ export default function NightVisionCamera() {
                 {facing === "back" ? "Rear" : "Front"}
               </Text>
             </View>
+            <View style={styles.intensityContainer}>
+              <Text style={styles.intensityLabel}>Intensity: {(intensity * 100).toFixed(0)}%</Text>
+              <Slider
+                style={styles.slider}
+                minimumValue={0}
+                maximumValue={2}
+                value={intensity}
+                onValueChange={setIntensity}
+                minimumTrackTintColor="#10b981"
+                maximumTrackTintColor="rgba(255, 255, 255, 0.3)"
+                thumbTintColor="#10b981"
+                step={0.1}
+              />
+            </View>
           </View>
         </View>
       </CameraView>
@@ -443,8 +478,7 @@ const styles = StyleSheet.create({
   },
   infoPanel: {
     position: "absolute",
-    bottom: 160,
-    left: 20,
+    top: 60,
     right: 20,
     backgroundColor: "rgba(0, 0, 0, 0.7)",
     padding: 16,
@@ -467,6 +501,22 @@ const styles = StyleSheet.create({
     color: "#fff",
     fontSize: 13,
     fontWeight: "600",
+  },
+  intensityContainer: {
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(255, 255, 255, 0.1)",
+  },
+  intensityLabel: {
+    color: "#10b981",
+    fontSize: 12,
+    fontWeight: "600",
+    marginBottom: 4,
+  },
+  slider: {
+    width: "100%",
+    height: 30,
   },
   enhancementOverlay: {
     ...StyleSheet.absoluteFillObject,

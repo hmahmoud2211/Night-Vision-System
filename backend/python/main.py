@@ -45,8 +45,9 @@ def stretch_contrast(rgb: np.ndarray, low_pct: float = 1.0, high_pct: float = 99
     return result
 
 
-def adaptive_histogram_equalization(rgb: np.ndarray, clip_limit: float = 3.0) -> np.ndarray:
+def adaptive_histogram_equalization(rgb: np.ndarray, clip_limit: float = 3.0, intensity: float = 1.0) -> np.ndarray:
     # Per-channel CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    # intensity: 0.0 = no effect, 1.0 = normal, 2.0 = double strength
     result = np.empty_like(rgb)
     for ch in range(3):
         channel = rgb[..., ch].astype(np.uint8)
@@ -69,11 +70,19 @@ def adaptive_histogram_equalization(rgb: np.ndarray, clip_limit: float = 3.0) ->
         
         result[..., ch] = equalized
     
+    # Blend with original based on intensity
+    if intensity < 1.0:
+        result = rgb * (1.0 - intensity) + result * intensity
+    elif intensity > 1.0:
+        # Amplify the effect
+        result = rgb + (result - rgb) * intensity
+    
     return np.clip(result, 0, 255)
 
 
-def multi_scale_retinex(rgb: np.ndarray, sigmas: list = [15, 80, 250]) -> np.ndarray:
+def multi_scale_retinex(rgb: np.ndarray, sigmas: list = [15, 80, 250], intensity: float = 1.0) -> np.ndarray:
     # Multi-Scale Retinex for low-light enhancement
+    # intensity: 0.0 = no effect, 1.0 = normal, 2.0 = double strength
     def single_scale_retinex(channel, sigma):
         from scipy.ndimage import gaussian_filter
         blurred = gaussian_filter(channel.astype(np.float32), sigma=sigma)
@@ -93,15 +102,29 @@ def multi_scale_retinex(rgb: np.ndarray, sigmas: list = [15, 80, 250]) -> np.nda
     
     # Normalize to 0-255
     result = (result - result.min()) / (result.max() - result.min() + 1e-8) * 255.0
+    
+    # Blend with original based on intensity
+    if intensity < 1.0:
+        result = rgb * (1.0 - intensity) + result * intensity
+    elif intensity > 1.0:
+        # Amplify the effect
+        result = rgb + (result - rgb) * intensity
+    
     return np.clip(result, 0, 255)
 
 
-def log_enhance(rgb: np.ndarray, c: float = 2.8) -> np.ndarray:
+def log_enhance(rgb: np.ndarray, c: float = 2.8, intensity: float = 1.0) -> np.ndarray:
     # Stronger log transform, then contrast stretch for a cleaner appearance.
+    # intensity: 0.0 = no effect, 1.0 = normal, 2.0 = double strength
     safe = np.maximum(rgb, 1.0)
-    enhanced = c * np.log1p(safe)
+    enhanced = c * intensity * np.log1p(safe)
     enhanced = enhanced / enhanced.max() * 255.0
     enhanced = stretch_contrast(enhanced, low_pct=1.5, high_pct=98.5)
+    
+    # Blend with original based on intensity
+    if intensity < 1.0:
+        enhanced = rgb * (1.0 - intensity) + enhanced * intensity
+    
     return np.clip(enhanced, 0, 255)
 
 
@@ -129,19 +152,63 @@ def frame_difference(prev: np.ndarray, curr: np.ndarray, diff_threshold: float, 
 
     prev_gray = to_gray(prev)
     curr_gray = to_gray(curr)
+    
+    # Adaptive threshold based on image brightness
+    avg_brightness = np.mean(curr_gray)
+    adaptive_threshold = diff_threshold
+    if avg_brightness < 50:  # Dark scene
+        adaptive_threshold *= 0.7  # More sensitive in dark
+    elif avg_brightness > 150:  # Bright scene
+        adaptive_threshold *= 1.3  # Less sensitive in bright
+    
+    # Calculate frame difference
     diff = np.abs(curr_gray - prev_gray)
-
-    moving = diff > diff_threshold
+    
+    # Apply Gaussian blur to reduce noise sensitivity
+    from scipy.ndimage import gaussian_filter
+    diff_smoothed = gaussian_filter(diff, sigma=2.0)
+    
+    # Create region of interest mask (center 60% of image gets higher weight)
+    h, w = diff.shape
+    roi_mask = np.zeros_like(diff)
+    y1, y2 = int(h * 0.2), int(h * 0.8)
+    x1, x2 = int(w * 0.2), int(w * 0.8)
+    roi_mask[y1:y2, x1:x2] = 2.0  # Center region weighted 2x
+    roi_mask[roi_mask == 0] = 1.0  # Edges weighted 1x
+    
+    # Apply ROI weighting
+    weighted_diff = diff_smoothed * roi_mask
+    
+    # Detect motion with adaptive threshold
+    moving = weighted_diff > adaptive_threshold
     motion_pixels = np.count_nonzero(moving)
     total_pixels = moving.size
     ratio = motion_pixels / total_pixels if total_pixels else 0.0
-    motion = ratio >= motion_ratio
+    
+    # Calculate motion magnitude (average difference in moving regions)
+    motion_magnitude = np.mean(diff[moving]) if motion_pixels > 0 else 0.0
+    
+    # Smart detection: require both sufficient pixel ratio AND motion magnitude
+    significant_motion = ratio >= motion_ratio and motion_magnitude > (adaptive_threshold * 0.5)
+    
+    # Calculate center of motion for tracking
+    if motion_pixels > 0:
+        y_coords, x_coords = np.where(moving)
+        center_x = int(np.mean(x_coords))
+        center_y = int(np.mean(y_coords))
+        motion_center = {"x": center_x / w, "y": center_y / h}  # Normalized coordinates
+    else:
+        motion_center = None
 
     return {
-        "motion": bool(motion),
+        "motion": bool(significant_motion),
         "diff_ratio": ratio,
-        "diff_threshold": diff_threshold,
+        "motion_magnitude": float(motion_magnitude),
+        "adaptive_threshold": float(adaptive_threshold),
         "motion_ratio": motion_ratio,
+        "avg_brightness": float(avg_brightness),
+        "motion_center": motion_center,
+        "confidence": float(min(1.0, (ratio / motion_ratio) * (motion_magnitude / adaptive_threshold))) if significant_motion else 0.0,
     }
 
 
@@ -151,8 +218,10 @@ async def enhance_image(
     luminance_threshold: float = 70.0,
     log_gain: float = 3.0,
     mode: str = "log",
+    intensity: float = 1.0,
 ):
-    """Enhancement modes: log, clahe, retinex, all"""
+    """Enhancement modes: log, clahe, retinex, all
+    intensity: 0.0 (no effect) to 2.0 (double strength), default 1.0"""
     content = await file.read()
     image = Image.open(io.BytesIO(content))
     data = to_numpy(image)
@@ -162,18 +231,18 @@ async def enhance_image(
     
     if lum < luminance_threshold:
         if mode == "log":
-            enhanced_data = log_enhance(data, c=log_gain)
+            enhanced_data = log_enhance(data, c=log_gain, intensity=intensity)
         elif mode == "clahe":
-            enhanced_data = adaptive_histogram_equalization(data, clip_limit=3.0)
+            enhanced_data = adaptive_histogram_equalization(data, clip_limit=3.0, intensity=intensity)
         elif mode == "retinex":
-            enhanced_data = multi_scale_retinex(data, sigmas=[15, 80, 250])
+            enhanced_data = multi_scale_retinex(data, sigmas=[15, 80, 250], intensity=intensity)
         elif mode == "all":
             # Combine all three for maximum enhancement
-            temp = log_enhance(data, c=log_gain)
-            temp = adaptive_histogram_equalization(temp, clip_limit=2.5)
-            enhanced_data = multi_scale_retinex(temp, sigmas=[10, 50, 150])
+            temp = log_enhance(data, c=log_gain, intensity=intensity)
+            temp = adaptive_histogram_equalization(temp, clip_limit=2.5, intensity=intensity)
+            enhanced_data = multi_scale_retinex(temp, sigmas=[10, 50, 150], intensity=intensity)
         else:
-            enhanced_data = log_enhance(data, c=log_gain)
+            enhanced_data = log_enhance(data, c=log_gain, intensity=intensity)
 
     enhanced = numpy_to_image(enhanced_data)
     buf = io.BytesIO()
@@ -184,6 +253,7 @@ async def enhance_image(
         "applied": lum < luminance_threshold,
         "luminance": lum,
         "mode": mode,
+        "intensity": intensity,
         "image_base64": encoded,
     }
 
