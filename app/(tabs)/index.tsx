@@ -18,7 +18,7 @@ import {
 import * as Haptics from "expo-haptics";
 import { Audio } from "expo-av";
 
-type EnhancementMode = "none" | "gamma" | "contrast" | "clahe" | "full";
+type EnhancementMode = "none" | "gamma" | "contrast" | "clahe" | "smart" | "full";
 
 type EnhancementVisual = {
   overlayColor: string;
@@ -131,14 +131,38 @@ export default function NightVisionCamera() {
           }
           
           const motionCount = motionHistoryRef.current.filter(Boolean).length;
-          const smartMotionDetected = motionCount >= 2 && result.confidence > 0.3;
+          
+          // Smart detection criteria:
+          // 1. Motion detected in 2+ of last 3 frames
+          // 2. Confidence above threshold (0.35)
+          // 3. At least one detected object
+          const hasConsistentMotion = motionCount >= 2;
+          const hasHighConfidence = result.confidence > 0.35;
+          const hasObjects = result.objects_count > 0;
+          
+          // Check for human-like objects (higher priority)
+          const humanlikeObjects = result.objects?.filter((obj: any) => obj.is_humanlike) || [];
+          const hasHumanlike = humanlikeObjects.length > 0;
+          
+          // Final smart decision
+          const smartMotionDetected = hasConsistentMotion && (
+            (hasHighConfidence && hasObjects) ||
+            (hasHumanlike && result.confidence > 0.25)  // Lower threshold for human-like
+          );
           
           if (smartMotionDetected) {
             consecutiveMotionRef.current += 1;
             // Trigger alert only after 2 consecutive positive detections
             if (consecutiveMotionRef.current >= 2) {
               setMotionDetected(true);
-              console.log(`Smart Motion: confidence=${result.confidence.toFixed(2)}, magnitude=${result.motion_magnitude.toFixed(1)}, center=${JSON.stringify(result.motion_center)}`);
+              console.log(`🎯 Smart Motion Detected:`, {
+                confidence: result.confidence?.toFixed(2),
+                objects: result.objects_count,
+                humanlike: humanlikeObjects.length,
+                magnitude: result.motion_magnitude?.toFixed(1),
+                brightness: result.avg_brightness?.toFixed(0),
+                center: result.motion_center,
+              });
             }
           } else {
             consecutiveMotionRef.current = 0;
@@ -160,7 +184,7 @@ export default function NightVisionCamera() {
   }, []);
 
   const cycleEnhancementMode = useCallback(() => {
-    const modes: EnhancementMode[] = ["none", "gamma", "contrast", "clahe", "full"];
+    const modes: EnhancementMode[] = ["none", "gamma", "contrast", "clahe", "smart", "full"];
     const currentIndex = modes.indexOf(enhancementMode);
     const nextMode = modes[(currentIndex + 1) % modes.length];
     setEnhancementMode(nextMode);
@@ -194,6 +218,12 @@ export default function NightVisionCamera() {
           scanLineColor: "#a855f7",
           scanLineOpacity: 0.5,
         };
+      case "smart":
+        return {
+          overlayColor: "rgba(251, 191, 36, 0.10)",
+          scanLineColor: "#fbbf24",
+          scanLineOpacity: 0.5,
+        };
       case "full":
         return {
           overlayColor: "rgba(34, 197, 94, 0.10)",
@@ -216,6 +246,8 @@ export default function NightVisionCamera() {
         return "Contrast";
       case "clahe":
         return "CLAHE";
+      case "smart":
+        return "Smart AI";
       case "full":
         return "Full Enhancement";
       default:
