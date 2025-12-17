@@ -199,36 +199,39 @@ export default function NightVisionCamera() {
   }, []);
 
   const getEnhancementVisuals = (): EnhancementVisual | null => {
+    // Apply intensity multiplier to all visual effects
+    const intensityMultiplier = intensity;
+    
     switch (enhancementMode) {
       case "gamma":
         return {
-          overlayColor: "rgba(59, 130, 246, 0.08)",
+          overlayColor: `rgba(59, 130, 246, ${0.08 * intensityMultiplier})`,
           scanLineColor: "#60a5fa",
-          scanLineOpacity: 0.4,
+          scanLineOpacity: 0.4 * intensityMultiplier,
         };
       case "contrast":
         return {
-          overlayColor: "rgba(16, 185, 129, 0.08)",
+          overlayColor: `rgba(16, 185, 129, ${0.08 * intensityMultiplier})`,
           scanLineColor: "#10b981",
-          scanLineOpacity: 0.4,
+          scanLineOpacity: 0.4 * intensityMultiplier,
         };
       case "clahe":
         return {
-          overlayColor: "rgba(168, 85, 247, 0.08)",
+          overlayColor: `rgba(168, 85, 247, ${0.08 * intensityMultiplier})`,
           scanLineColor: "#a855f7",
-          scanLineOpacity: 0.5,
+          scanLineOpacity: 0.5 * intensityMultiplier,
         };
       case "smart":
         return {
-          overlayColor: "rgba(251, 191, 36, 0.10)",
+          overlayColor: `rgba(251, 191, 36, ${0.10 * intensityMultiplier})`,
           scanLineColor: "#fbbf24",
-          scanLineOpacity: 0.5,
+          scanLineOpacity: 0.5 * intensityMultiplier,
         };
       case "full":
         return {
-          overlayColor: "rgba(34, 197, 94, 0.10)",
+          overlayColor: `rgba(34, 197, 94, ${0.10 * intensityMultiplier})`,
           scanLineColor: "#22c55e",
-          scanLineOpacity: 0.6,
+          scanLineOpacity: 0.6 * intensityMultiplier,
         };
       case "none":
       default:
@@ -350,7 +353,10 @@ export default function NightVisionCamera() {
               </Text>
             </View>
             <View style={styles.intensityContainer}>
-              <Text style={styles.intensityLabel}>Intensity: {(intensity * 100).toFixed(0)}%</Text>
+              <View style={styles.intensityHeader}>
+                <Text style={styles.intensityLabel}>Intensity</Text>
+                <Text style={styles.intensityValue}>{(intensity * 100).toFixed(0)}%</Text>
+              </View>
               <Slider
                 style={styles.slider}
                 minimumValue={0}
@@ -362,6 +368,11 @@ export default function NightVisionCamera() {
                 thumbTintColor="#10b981"
                 step={0.1}
               />
+              <View style={styles.intensityMarkers}>
+                <Text style={styles.markerText}>0%</Text>
+                <Text style={styles.markerText}>100%</Text>
+                <Text style={styles.markerText}>200%</Text>
+              </View>
             </View>
           </View>
         </View>
@@ -540,15 +551,34 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: "rgba(255, 255, 255, 0.1)",
   },
-  intensityLabel: {
-    color: "#10b981",
-    fontSize: 12,
-    fontWeight: "600",
+  intensityHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
     marginBottom: 4,
+  },
+  intensityLabel: {
+    color: "#9ca3af",
+    fontSize: 12,
+    fontWeight: "500",
+  },
+  intensityValue: {
+    color: "#10b981",
+    fontSize: 14,
+    fontWeight: "700",
   },
   slider: {
     width: "100%",
     height: 30,
+  },
+  intensityMarkers: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingHorizontal: 4,
+  },
+  markerText: {
+    color: "rgba(255, 255, 255, 0.4)",
+    fontSize: 10,
   },
   enhancementOverlay: {
     ...StyleSheet.absoluteFillObject,
