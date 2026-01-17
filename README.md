@@ -59,7 +59,7 @@ A real-time night vision and motion detection security system built with React N
 ### 1. Clone the Repository
 ```bash
 git clone https://github.com/hmahmoud2211/Night-Vision-System.git
-cd Night_Vision_System
+cd Night-Vision-System
 ```
 
 ### 2. Frontend Setup
@@ -91,16 +91,34 @@ pip install -r requirements.txt
 
 ## 🎮 Usage
 
+### Run the System (Quick Start)
+1) **Start Backend**
+```bash
+cd backend/python
+uvicorn main:app --host 0.0.0.0 --port 8001
+```
+2) **Start Frontend**
+```bash
+# From project root
+npx expo start
+```
+3) **Set API Base URL (first run only)**
+```bash
+# Create .env file in project root
+EXPO_PUBLIC_RORK_API_BASE_URL=http://YOUR_IP_ADDRESS:8001
+```
+Replace `YOUR_IP_ADDRESS` with your machine's local IP.
+
 ### Start the Backend Server
 ```bash
 # Navigate to backend directory
 cd backend/python
 
 # Run with auto-reload (development)
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 0.0.0.0 --port 8001 --reload
 
-# Server will be available at http://localhost:8000
-# API documentation at http://localhost:8000/docs
+# Server will be available at http://localhost:8001
+# API documentation at http://localhost:8001/docs
 ```
 
 ### Start the Frontend App
@@ -118,7 +136,7 @@ npx expo start
 Set the backend URL in your environment:
 ```bash
 # Create .env file in project root
-EXPO_PUBLIC_RORK_API_BASE_URL=http://YOUR_IP_ADDRESS:8000
+EXPO_PUBLIC_RORK_API_BASE_URL=http://YOUR_IP_ADDRESS:8001
 ```
 Replace `YOUR_IP_ADDRESS` with your machine's local IP (use `ipconfig` on Windows or `ifconfig` on macOS/Linux).
 
