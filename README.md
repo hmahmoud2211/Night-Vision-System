@@ -91,6 +91,13 @@ pip install -r requirements.txt
 
 ## 🎮 Usage
 
+### Backend AI Key (.env)
+Create a `.env` file in backend/python with your Groq API key:
+```bash
+GROQ_API_KEY=your_groq_api_key_here
+```
+Do not commit this file.
+
 ### Start the Backend Server
 ```bash
 # Navigate to backend directory
