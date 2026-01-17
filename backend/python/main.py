@@ -1,14 +1,32 @@
 import base64
 import io
-from typing import Optional
+import os
+import time
+import hashlib
+from typing import Optional, List
+from pathlib import Path
+
+# Load environment variables from .env file (use absolute path)
+from dotenv import load_dotenv
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from scipy.ndimage import gaussian_filter, median_filter, uniform_filter, label
 
-app = FastAPI(title="Night Vision Backend", version="0.2.0")
+# Groq AI integration
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    Groq = None
+
+app = FastAPI(title="Night Vision Backend", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,16 +43,70 @@ background_model = {
     "learning_rate": 0.05
 }
 
+# Simple cache for analysis results to avoid recomputation on identical frames
+analysis_cache = {
+    "hash": None,
+    "result": None,
+}
+
+# Groq client singleton
+_groq_client = None
+
+def get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if api_key and GROQ_AVAILABLE:
+            _groq_client = Groq(api_key=api_key)
+    return _groq_client
+
+
+# AI Detection payloads
+class AIDetectPayload(BaseModel):
+    image_base64: str
+    detect_classes: List[str] = ["person", "intruder", "weapon", "vehicle", "animal", "suspicious_activity"]
+    confidence_threshold: float = 0.5
+
+
+class AIEnhancePayload(BaseModel):
+    image_base64: str
+    enhancement_prompt: str = "Enhance this night vision image for better visibility and clarity"
+
+
+class AIScenePayload(BaseModel):
+    image_base64: str
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
+@app.get("/status")
+async def status():
+    return {
+        "status": "ok",
+        "version": app.version,
+        "background_frames": background_model["frame_count"],
+    }
+
+
 def to_numpy(image: Image.Image) -> np.ndarray:
     if image.mode != "RGB":
         image = image.convert("RGB")
     return np.asarray(image).astype(np.float32)
+
+
+def downscale_if_needed(image: Image.Image, max_side: Optional[int]) -> Image.Image:
+    if not max_side:
+        return image
+    w, h = image.size
+    longest = max(w, h)
+    if longest <= max_side:
+        return image
+    scale = max_side / float(longest)
+    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    return image.resize(new_size, Image.BILINEAR)
 
 
 def stretch_contrast(rgb: np.ndarray, low_pct: float = 1.0, high_pct: float = 99.0) -> np.ndarray:
@@ -277,6 +349,44 @@ def mean_luminance(rgb: np.ndarray) -> float:
     return float(np.mean(0.299 * r + 0.587 * g + 0.114 * b))
 
 
+def compute_image_stats(rgb: np.ndarray) -> dict:
+    gray = to_gray(rgb)
+    luminance = float(np.mean(gray))
+    noise = float(np.std(gray - gaussian_filter(gray, sigma=1.0)))
+    contrast = float(np.std(gray))
+    p5, p95 = np.percentile(gray, [5, 95])
+    dynamic_range = float(p95 - p5)
+
+    # Simple Laplacian-based sharpness
+    laplace = (
+        -4 * gray
+        + np.roll(gray, 1, axis=0)
+        + np.roll(gray, -1, axis=0)
+        + np.roll(gray, 1, axis=1)
+        + np.roll(gray, -1, axis=1)
+    )
+    sharpness = float(np.var(laplace))
+
+    # Recommend mode based on luminance/noise
+    if luminance < 30:
+        recommended_mode = "smart"
+    elif luminance < 65:
+        recommended_mode = "retinex" if noise < 18 else "smart"
+    elif noise > 22:
+        recommended_mode = "clahe"
+    else:
+        recommended_mode = "log"
+
+    return {
+        "luminance": luminance,
+        "noise": noise,
+        "contrast": contrast,
+        "dynamic_range": dynamic_range,
+        "sharpness": sharpness,
+        "recommended_mode": recommended_mode,
+    }
+
+
 def numpy_to_image(arr: np.ndarray) -> Image.Image:
     return Image.fromarray(arr.astype(np.uint8))
 
@@ -284,6 +394,35 @@ def numpy_to_image(arr: np.ndarray) -> Image.Image:
 def to_gray(rgb: np.ndarray) -> np.ndarray:
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def decode_base64_image(data: str) -> Image.Image:
+    if data.startswith("data:"):
+        data = data.split(",", 1)[1]
+    raw = base64.b64decode(data)
+    return Image.open(io.BytesIO(raw))
+
+
+class MotionBase64Payload(BaseModel):
+    current_base64: str
+    previous_base64: str
+    diff_threshold: float = 25.0
+    motion_ratio: float = 0.02
+
+
+class AnalyzeBase64Payload(BaseModel):
+    image_base64: str
+    max_side: Optional[int] = 640
+
+
+class EnhanceBase64Payload(BaseModel):
+    image_base64: str
+    luminance_threshold: float = 70.0
+    log_gain: float = 3.0
+    mode: str = "log"
+    intensity: float = 1.0
+    max_side: Optional[int] = 960
+    include_stats: bool = False
 
 
 def frame_difference(prev: np.ndarray, curr: np.ndarray, diff_threshold: float, motion_ratio: float) -> dict:
@@ -484,11 +623,15 @@ async def enhance_image(
     log_gain: float = 3.0,
     mode: str = "log",
     intensity: float = 1.0,
+    max_side: Optional[int] = 960,
+    include_stats: bool = False,
 ):
     """Enhancement modes: log, clahe, retinex, smart, all
     intensity: 0.0 (no effect) to 2.0 (double strength), default 1.0"""
+    start_time = time.perf_counter()
     content = await file.read()
     image = Image.open(io.BytesIO(content))
+    image = downscale_if_needed(image, max_side)
     data = to_numpy(image)
 
     lum = mean_luminance(data)
@@ -545,6 +688,9 @@ async def enhance_image(
     enhanced.save(buf, format="PNG")
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")
 
+    stats = compute_image_stats(enhanced_data) if include_stats else None
+    processing_ms = (time.perf_counter() - start_time) * 1000.0
+
     return {
         "applied": needs_enhancement or mode == "smart",
         "luminance": float(lum),
@@ -552,7 +698,129 @@ async def enhance_image(
         "mode": mode,
         "enhancement_applied": enhancement_applied,
         "intensity": intensity,
+        "processing_ms": float(processing_ms),
+        "image_size": {"width": enhanced.width, "height": enhanced.height},
+        "stats": stats,
         "image_base64": encoded,
+    }
+
+
+@app.post("/enhance-base64")
+async def enhance_image_base64(payload: EnhanceBase64Payload):
+    start_time = time.perf_counter()
+    image = decode_base64_image(payload.image_base64)
+    image = downscale_if_needed(image, payload.max_side)
+    data = to_numpy(image)
+
+    lum = mean_luminance(data)
+    enhanced_data = data
+    enhancement_applied = "none"
+
+    needs_enhancement = lum < payload.luminance_threshold
+    noise_level = np.std(data - gaussian_filter(data, sigma=1.0))
+
+    if needs_enhancement or payload.mode == "smart":
+        if payload.mode == "log":
+            enhanced_data = log_enhance(data, c=payload.log_gain, intensity=payload.intensity)
+            enhancement_applied = "log"
+        elif payload.mode == "clahe":
+            enhanced_data = adaptive_histogram_equalization(data, clip_limit=3.0, intensity=payload.intensity)
+            enhancement_applied = "clahe"
+        elif payload.mode == "retinex":
+            enhanced_data = multi_scale_retinex(data, sigmas=[15, 80, 250], intensity=payload.intensity)
+            enhancement_applied = "retinex"
+        elif payload.mode == "smart":
+            if lum < 30:
+                temp = log_enhance(data, c=payload.log_gain * 1.2, intensity=payload.intensity)
+                enhanced_data = smart_enhance(temp, intensity=payload.intensity)
+                enhancement_applied = "smart_dark"
+            elif lum < 60:
+                enhanced_data = multi_scale_retinex(data, sigmas=[15, 80, 250], intensity=payload.intensity)
+                enhanced_data = denoise_image(enhanced_data, strength=payload.intensity * 0.5)
+                enhancement_applied = "smart_retinex"
+            elif noise_level > 15:
+                denoised = denoise_image(data, strength=payload.intensity)
+                enhanced_data = adaptive_histogram_equalization(denoised, clip_limit=2.5, intensity=payload.intensity)
+                enhancement_applied = "smart_denoise"
+            else:
+                enhanced_data = smart_enhance(data, intensity=payload.intensity)
+                enhancement_applied = "smart_auto"
+        elif payload.mode == "all":
+            temp = log_enhance(data, c=payload.log_gain, intensity=payload.intensity)
+            temp = adaptive_histogram_equalization(temp, clip_limit=2.5, intensity=payload.intensity)
+            enhanced_data = multi_scale_retinex(temp, sigmas=[10, 50, 150], intensity=payload.intensity)
+            enhancement_applied = "all"
+        else:
+            enhanced_data = log_enhance(data, c=payload.log_gain, intensity=payload.intensity)
+            enhancement_applied = "log_default"
+
+    enhanced = numpy_to_image(enhanced_data)
+    buf = io.BytesIO()
+    enhanced.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    stats = compute_image_stats(enhanced_data) if payload.include_stats else None
+    processing_ms = (time.perf_counter() - start_time) * 1000.0
+
+    return {
+        "applied": needs_enhancement or payload.mode == "smart",
+        "luminance": float(lum),
+        "noise_level": float(noise_level),
+        "mode": payload.mode,
+        "enhancement_applied": enhancement_applied,
+        "intensity": payload.intensity,
+        "processing_ms": float(processing_ms),
+        "image_size": {"width": enhanced.width, "height": enhanced.height},
+        "stats": stats,
+        "image_base64": encoded,
+    }
+
+
+@app.post("/analyze")
+async def analyze_image(
+    file: UploadFile = File(...),
+    max_side: Optional[int] = 640,
+):
+    start_time = time.perf_counter()
+    content = await file.read()
+
+    frame_hash = hashlib.md5(content).hexdigest()
+    if analysis_cache["hash"] == frame_hash:
+        cached = analysis_cache["result"]
+        if cached:
+            return cached
+
+    image = Image.open(io.BytesIO(content))
+    image = downscale_if_needed(image, max_side)
+    data = to_numpy(image)
+
+    stats = compute_image_stats(data)
+    processing_ms = (time.perf_counter() - start_time) * 1000.0
+
+    result = {
+        **stats,
+        "processing_ms": float(processing_ms),
+        "image_size": {"width": image.width, "height": image.height},
+    }
+    analysis_cache["hash"] = frame_hash
+    analysis_cache["result"] = result
+    return result
+
+
+@app.post("/analyze-base64")
+async def analyze_image_base64(payload: AnalyzeBase64Payload):
+    start_time = time.perf_counter()
+    image = decode_base64_image(payload.image_base64)
+    image = downscale_if_needed(image, payload.max_side)
+    data = to_numpy(image)
+
+    stats = compute_image_stats(data)
+    processing_ms = (time.perf_counter() - start_time) * 1000.0
+
+    return {
+        **stats,
+        "processing_ms": float(processing_ms),
+        "image_size": {"width": image.width, "height": image.height},
     }
 
 
@@ -562,6 +830,7 @@ async def detect_motion(
     previous: UploadFile = File(...),
     diff_threshold: float = Form(25.0),
     motion_ratio: float = Form(0.02),
+    max_side: Optional[int] = Form(640),
 ):
     """Frame differencing motion detection.
 
@@ -572,11 +841,362 @@ async def detect_motion(
     curr_bytes = await current.read()
     prev_bytes = await previous.read()
 
+    start_time = time.perf_counter()
     curr_img = Image.open(io.BytesIO(curr_bytes))
     prev_img = Image.open(io.BytesIO(prev_bytes))
+    curr_img = downscale_if_needed(curr_img, max_side)
+    prev_img = downscale_if_needed(prev_img, max_side)
 
     curr_np = to_numpy(curr_img)
     prev_np = to_numpy(prev_img)
 
     result = frame_difference(prev_np, curr_np, diff_threshold, motion_ratio)
+    result["processing_ms"] = float((time.perf_counter() - start_time) * 1000.0)
     return result
+
+
+@app.post("/motion-base64")
+async def detect_motion_base64(payload: MotionBase64Payload):
+    start_time = time.perf_counter()
+    curr_img = decode_base64_image(payload.current_base64)
+    prev_img = decode_base64_image(payload.previous_base64)
+
+    curr_np = to_numpy(curr_img)
+    prev_np = to_numpy(prev_img)
+
+    result = frame_difference(prev_np, curr_np, payload.diff_threshold, payload.motion_ratio)
+    result["processing_ms"] = float((time.perf_counter() - start_time) * 1000.0)
+    return result
+
+
+@app.post("/calibrate")
+async def calibrate_background():
+    background_model["mean"] = None
+    background_model["variance"] = None
+    background_model["frame_count"] = 0
+    return {"status": "ok", "message": "Background model reset"}
+
+
+# ============ AI-POWERED ENDPOINTS (GROQ) ============
+
+@app.get("/ai/status")
+async def ai_status():
+    """Check if AI services are available."""
+    client = get_groq_client()
+    return {
+        "groq_available": GROQ_AVAILABLE,
+        "groq_configured": client is not None,
+        "api_key_set": bool(os.environ.get("GROQ_API_KEY")),
+    }
+
+
+@app.post("/ai/detect")
+async def ai_detect_threats(payload: AIDetectPayload):
+    """
+    Use Groq AI to detect threats, intruders, and objects in an image.
+    Returns detected objects with confidence scores and threat levels.
+    """
+    import json as json_module
+    import re
+    
+    start_time = time.perf_counter()
+    client = get_groq_client()
+    
+    if not client:
+        raise HTTPException(status_code=503, detail="Groq AI not configured. Set GROQ_API_KEY environment variable.")
+    
+    # Decode and prepare image
+    image = decode_base64_image(payload.image_base64)
+    
+    # Resize for API efficiency
+    max_side = 512
+    w, h = image.size
+    if max(w, h) > max_side:
+        scale = max_side / max(w, h)
+        image = image.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+    
+    # Convert RGBA to RGB if needed (JPEG doesn't support alpha)
+    if image.mode == 'RGBA':
+        image = image.convert('RGB')
+    
+    # Convert to base64 for API
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=85)
+    image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    
+    detect_classes_str = ", ".join(payload.detect_classes)
+    
+    prompt = f"""Analyze this security camera image for threat detection. 
+
+Look for these specific classes: {detect_classes_str}
+
+For each detected object, provide:
+1. Object class (from the list above)
+2. Confidence score (0.0 to 1.0)
+3. Approximate location in the image (top-left, top-right, center, bottom-left, bottom-right)
+4. Threat level (none, low, medium, high, critical)
+5. Brief description
+
+If you detect any suspicious activity, intruders, or potential threats, flag them with high priority.
+
+Respond in JSON format:
+{{
+    "detections": [
+        {{
+            "class": "person",
+            "confidence": 0.95,
+            "location": "center",
+            "threat_level": "medium",
+            "description": "Person wearing dark clothing"
+        }}
+    ],
+    "scene_summary": "Nighttime outdoor scene with one person detected",
+    "overall_threat_level": "medium",
+    "recommended_action": "Monitor closely",
+    "visibility_quality": "low"
+}}
+
+If no objects of interest are detected, return empty detections array."""
+
+    try:
+        completion = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.3,
+            max_tokens=2048,
+        )
+        
+        response_text = completion.choices[0].message.content
+        
+        # Try to parse JSON from response
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        if json_match:
+            result = json_module.loads(json_match.group())
+        else:
+            result = {
+                "detections": [],
+                "scene_summary": response_text,
+                "overall_threat_level": "unknown",
+                "recommended_action": "Manual review required",
+                "visibility_quality": "unknown",
+                "raw_response": response_text
+            }
+        
+        # Filter by confidence threshold
+        if "detections" in result:
+            result["detections"] = [
+                d for d in result["detections"] 
+                if d.get("confidence", 0) >= payload.confidence_threshold
+            ]
+        
+        result["processing_ms"] = float((time.perf_counter() - start_time) * 1000.0)
+        result["ai_model"] = "llama-4-scout-17b"
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI detection failed: {str(e)}")
+
+
+@app.post("/ai/scene")
+async def ai_analyze_scene(payload: AIScenePayload):
+    """
+    Comprehensive scene analysis using Groq AI.
+    Provides detailed description of the environment, lighting, and activity.
+    """
+    import json as json_module
+    import re
+    
+    start_time = time.perf_counter()
+    client = get_groq_client()
+    
+    if not client:
+        raise HTTPException(status_code=503, detail="Groq AI not configured. Set GROQ_API_KEY environment variable.")
+    
+    image = decode_base64_image(payload.image_base64)
+    
+    # Resize for API
+    max_side = 512
+    w, h = image.size
+    if max(w, h) > max_side:
+        scale = max_side / max(w, h)
+        image = image.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+    
+    # Convert RGBA to RGB if needed (JPEG doesn't support alpha)
+    if image.mode == 'RGBA':
+        image = image.convert('RGB')
+    
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=85)
+    image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    
+    prompt = """Analyze this security/night vision camera image and provide a comprehensive scene analysis.
+
+Provide:
+1. Environment type (indoor, outdoor, parking lot, street, building entrance, etc.)
+2. Lighting conditions (bright, dim, dark, night vision, infrared)
+3. Weather conditions if visible (clear, rain, fog, snow)
+4. Time of day estimate (day, dusk, night)
+5. All visible objects and their positions
+6. Any movement or activity detected
+7. Potential security concerns
+8. Image quality assessment
+
+Respond in JSON format:
+{
+    "environment": "outdoor parking lot",
+    "lighting": "low-light night vision",
+    "weather": "clear",
+    "time_of_day": "night",
+    "objects": ["car", "lamppost", "fence"],
+    "activity": "no movement detected",
+    "security_concerns": [],
+    "image_quality": "moderate - some noise present",
+    "visibility_score": 0.6,
+    "description": "Nighttime view of a parking lot with one parked vehicle..."
+}"""
+
+    try:
+        completion = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        
+        response_text = completion.choices[0].message.content
+        
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        if json_match:
+            result = json_module.loads(json_match.group())
+        else:
+            result = {
+                "description": response_text,
+                "raw_response": response_text
+            }
+        
+        result["processing_ms"] = float((time.perf_counter() - start_time) * 1000.0)
+        result["ai_model"] = "llama-4-scout-17b"
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scene analysis failed: {str(e)}")
+
+
+@app.post("/ai/smart-alert")
+async def ai_smart_alert(payload: AIDetectPayload):
+    """
+    Intelligent alert system that combines motion detection with AI analysis.
+    Only triggers alerts for genuine security concerns.
+    """
+    import json as json_module
+    import re
+    
+    start_time = time.perf_counter()
+    client = get_groq_client()
+    
+    if not client:
+        # Fallback to basic detection
+        return {
+            "alert": False,
+            "reason": "AI not available, using basic detection",
+            "ai_available": False,
+            "processing_ms": float((time.perf_counter() - start_time) * 1000.0)
+        }
+    
+    image = decode_base64_image(payload.image_base64)
+    
+    # Smaller image for faster processing
+    max_side = 384
+    w, h = image.size
+    if max(w, h) > max_side:
+        scale = max_side / max(w, h)
+        image = image.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+    
+    # Convert RGBA to RGB if needed (JPEG doesn't support alpha)
+    if image.mode == 'RGBA':
+        image = image.convert('RGB')
+    
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=70)
+    image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    
+    prompt = """Security scan. Check for: intruders, weapons, suspicious activity, masked persons, unauthorized vehicles.
+
+Respond ONLY with JSON:
+{"alert": true/false, "alert_level": "none/low/medium/high/critical", "reason": "brief", "detected_threats": [], "confidence": 0.0-1.0, "recommended_action": "action"}"""
+
+    try:
+        completion = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+        )
+        
+        response_text = completion.choices[0].message.content
+        
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        if json_match:
+            result = json_module.loads(json_match.group())
+        else:
+            result = {
+                "alert": False,
+                "reason": "Could not parse AI response",
+                "raw_response": response_text
+            }
+        
+        result["processing_ms"] = float((time.perf_counter() - start_time) * 1000.0)
+        result["ai_model"] = "llama-4-scout-17b"
+        result["ai_available"] = True
+        
+        return result
+        
+    except Exception as e:
+        return {
+            "alert": False,
+            "reason": f"AI analysis failed: {str(e)}",
+            "ai_available": False,
+            "processing_ms": float((time.perf_counter() - start_time) * 1000.0)
+        }

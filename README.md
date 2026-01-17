@@ -22,6 +22,8 @@ A real-time night vision and motion detection security system built with React N
 - **Mode-Specific Overlays**: Color-coded scan lines and overlays for each enhancement mode
 - **Real-Time Camera Feed**: Live camera preview with enhancement processing
 - **Responsive Controls**: Easy mode switching and settings adjustment
+- **Animated Intro & HUD**: Polished introduction and live telemetry overlays
+- **Enhanced Preview**: Periodic enhanced frame preview for validation
 
 ## 🏗️ Architecture
 
@@ -42,6 +44,8 @@ A real-time night vision and motion detection security system built with React N
   - Pillow 10.4.0 for image I/O
   - SciPy 1.14.1 for gaussian filtering
 - **API**: RESTful endpoints with multipart/form-data support
+- **Telemetry Analysis**: Live image quality metrics and recommended enhancement modes
+- **Adaptive Motion Modeling**: Background modeling with confidence scoring and object clustering
 
 ## 📋 Prerequisites
 
@@ -126,6 +130,12 @@ GET /health
 ```
 Returns server status.
 
+### Status
+```http
+GET /status
+```
+Returns server version and background model frames.
+
 **Response:**
 ```json
 {
@@ -159,6 +169,13 @@ Content-Type: multipart/form-data
 }
 ```
 
+### Telemetry Analysis
+```http
+POST /analyze
+Content-Type: multipart/form-data
+```
+Returns luminance, noise, contrast, sharpness, dynamic range, and recommended mode.
+
 ### Motion Detection
 ```http
 POST /motion
@@ -180,6 +197,12 @@ Content-Type: multipart/form-data
   "motion_ratio": 0.02
 }
 ```
+
+### Calibrate Background Model
+```http
+POST /calibrate
+```
+Resets the adaptive background model for motion detection.
 
 ## 🧪 Enhancement Algorithms Explained
 
